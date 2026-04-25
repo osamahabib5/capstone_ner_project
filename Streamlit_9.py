@@ -9,15 +9,13 @@ import os
 import json
 import re
 import warnings
-import subprocess
-import sys
 from textwrap import dedent
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from nltk.corpus import stopwords
 import nltk
 import spacy
-from openai import OpenAI
+from groq import Groq
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -28,8 +26,7 @@ def load_resources():
     """Download NLTK data and load Spacy model once."""
     try:
         nltk.download('stopwords', quiet=True)
-        # Ensure spacy model is loaded. 
-        # Note: In Streamlit Cloud, ensure 'en_core_web_lg' is in requirements.txt
+        # Ensure 'en_core_web_lg' is in your requirements.txt for Streamlit Cloud
         nlp = spacy.load("en_core_web_lg")
         return nlp
     except Exception as e:
@@ -62,16 +59,13 @@ def read_pdf(file):
 
 def calc_sim(user_resume_df, database_df):
     """Calculate cosine similarity between user resume and database."""
-    # Convert dataframe to a single string of text
     new_resume_text = " ".join(user_resume_df['Redacted Text'].astype(str).tolist())
-    
     db_texts = database_df['Redacted Text'].astype(str).tolist()
     all_texts = db_texts + [new_resume_text]
     
     vec = TfidfVectorizer(stop_words=sw)
     tfidf_matrix = vec.fit_transform(all_texts)
     
-    # Compare the last item (user) against all previous items (database)
     similarity_matrix = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])
     similar_indices = similarity_matrix.argsort()[0][-5:][::-1]
     
@@ -83,29 +77,21 @@ def ner_redaction(text):
         return text
     doc = nlp(text)
     redacted_text = text
-
-    # Sort entities by length descending to avoid partial redaction issues
     entities = sorted(doc.ents, key=lambda x: len(x.text), reverse=True)
-    
-    # Specific categories to redact
     target_labels = ['PERSON', 'ORG', 'GPE', 'FAC', 'LOC']
     
     for ent in entities:
         if ent.label_ in target_labels:
             redacted_text = redacted_text.replace(ent.text, "[Redacted]")
 
-    # Regex for Contact Info
     redacted_text = re.sub(r'\S+@\S+', '[Redacted Email]', redacted_text)
     redacted_text = re.sub(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[Redacted Phone]', redacted_text)
     redacted_text = re.sub(r'\b(?:https?://)?(?:www\.)?linkedin\.com/in/[a-zA-Z0-9._-]+\b', '[Redacted Website]', redacted_text)
-    
     return redacted_text
 
 # --- UI Setup ---
-
 st.set_page_config(page_title="Saxa-4 Recommendation System", layout="wide")
 
-# Use local relative path for images
 if os.path.exists('georgetown_image.jpeg'):
     st.image('georgetown_image.jpeg', use_container_width=True)
 
@@ -121,7 +107,6 @@ st.markdown("""
 st.markdown('---')
 
 # --- Data Loading ---
-# Using relative paths for deployment compatibility
 csv_file_path = 'spacy_redacted_documents_with_id_and_category.csv'
 json_db_path = 'redacted_resumes_output.json'
 
@@ -131,10 +116,9 @@ else:
     st.error(f"Database file {csv_file_path} not found.")
     resumes_db = pd.DataFrame(columns=['Redacted Text'])
 
-# --- OpenAI Client Setup ---
-# Priority: Streamlit Secrets (for cloud) -> Environment Variable
-api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key) if api_key else None
+# --- Groq Client Setup ---
+groq_api_key = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 # --- Main App Logic ---
 
@@ -168,8 +152,22 @@ if uploaded_file:
 
 st.markdown('---')
 
+def groq_stream_generator(prompt):
+    """Generator for streaming responses from Groq."""
+    completion = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=1,
+        max_completion_tokens=8192,
+        top_p=1,
+        reasoning_effort="medium",
+        stream=True
+    )
+    for chunk in completion:
+        yield chunk.choices[0].delta.content or ""
+
 if resume_df is not None and not resumes_db.empty:
-    st.markdown('## Section 2 - LLM Recommendations')
+    st.markdown('## Section 2 - Groq LLM Recommendations')
     
     default_prompt = dedent("""
         You are a helpful recommender tool. You will be provided a resume and a list of similar job examples. 
@@ -181,24 +179,15 @@ if resume_df is not None and not resumes_db.empty:
 
     if st.button('Get Recommendations'):
         if not client:
-            st.error("OpenAI API Key missing. Please check your secrets.")
+            st.error("Groq API Key missing. Please set GROQ_API_KEY in secrets or environment.")
         else:
-            with st.spinner('Analyzing similarities...'):
+            with st.spinner('Groq is thinking...'):
                 indices = calc_sim(resume_df, resumes_db)
                 similar_docs = "\n---\n".join(resumes_db.iloc[indices]['Redacted Text'].tolist())
-                
                 full_query = f"{user_prompt}\n\nUser Resume Content:\n{resume_text_raw}\n\nSimilar Examples to Reference:\n{similar_docs}"
                 
-                try:
-                    response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": full_query}],
-                        temperature=0.3
-                    )
-                    st.markdown("### Recommendation Output")
-                    st.write(response.choices[0].message.content)
-                except Exception as e:
-                    st.error(f"LLM Error: {e}")
+                st.markdown("### Recommendation Output")
+                st.write_stream(groq_stream_generator(full_query))
 
     st.markdown('---')
     st.markdown('## Section 3 - PII Redaction')
@@ -211,20 +200,13 @@ if resume_df is not None and not resumes_db.empty:
         redacted_df = pd.DataFrame({'Redacted Text': [redacted_text]})
 
         st.markdown('### Section 4 - Recommendation with Prompt Enhancement')
-        st.info("This version informs the LLM specifically that information has been redacted.")
-        
         if st.button('Get Recommendations (Redacted)'):
-            with st.spinner('Processing...'):
-                enh_prompt = f"The following resume has PII redacted as [Redacted]. Please recommend 5 roles based on the visible skills:\n\n{redacted_text}"
-                try:
-                    response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": enh_prompt}],
-                        temperature=0.5
-                    )
-                    st.write(response.choices[0].message.content)
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            if not client:
+                st.error("Groq API Key missing.")
+            else:
+                with st.spinner('Processing redacted analysis...'):
+                    enh_prompt = f"The following resume has PII redacted as [Redacted]. Please recommend 5 roles based on the visible skills:\n\n{redacted_text}"
+                    st.write_stream(groq_stream_generator(enh_prompt))
 
         # --- Data Privacy Section ---
         st.markdown('---')
@@ -233,7 +215,6 @@ if resume_df is not None and not resumes_db.empty:
         col1, col2 = st.columns(2)
         with col1:
             if st.button('Yes, save my redacted data'):
-                # Append to JSON
                 new_entry = redacted_df.to_dict(orient='records')
                 try:
                     existing_entries = []
@@ -242,7 +223,6 @@ if resume_df is not None and not resumes_db.empty:
                             for line in f:
                                 existing_entries.append(json.loads(line))
                     
-                    # Check for duplicates
                     if any(e['Redacted Text'] == redacted_text for e in existing_entries):
                         st.warning("This content is already in our database.")
                     else:
@@ -255,6 +235,5 @@ if resume_df is not None and not resumes_db.empty:
         with col2:
             if st.button('No, keep it private'):
                 st.info("We respect your privacy. No data was saved.")
-
 else:
     st.info("Upload a resume to begin the analysis.")
