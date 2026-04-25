@@ -7,93 +7,49 @@ import csv
 import io
 import os
 import json
+import re
+import warnings
+import subprocess
+import sys
 from textwrap import dedent
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from nltk.corpus import stopwords
-import warnings
-warnings.filterwarnings("ignore")
-import openai
-from openai import OpenAI
-from sklearn.metrics.pairwise import cosine_similarity 
+import nltk
 import spacy
-nlp = spacy.load("en_core_web_lg")
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-import re
-from dotenv import load_dotenv
-import os
+from openai import OpenAI
 
-#####################################################################
+# Ignore warnings
+warnings.filterwarnings("ignore")
 
-st.image('georgetown_image.jpeg',
-         use_column_width= True)
+# --- Resource Caching ---
+@st.cache_resource
+def load_resources():
+    """Download NLTK data and load Spacy model once."""
+    try:
+        nltk.download('stopwords', quiet=True)
+        # Ensure spacy model is loaded. 
+        # Note: In Streamlit Cloud, ensure 'en_core_web_lg' is in requirements.txt
+        nlp = spacy.load("en_core_web_lg")
+        return nlp
+    except Exception as e:
+        st.error(f"Error loading NLP resources: {e}")
+        return None
 
+nlp = load_resources()
+sw = stopwords.words("english")
+sw.extend(['[Redacted]'])
 
-st.markdown(
-    """
-    <style>
-    .main-caption {
-        font-size: 24px;
-        font-weight: bold;
-        text-align: center;
-        color: #333;
-    }
-    .name-list {
-        font-size: 18px;
-        text-align: center;
-        color: #555;
-    }
-    </style>
-    <p class="main-caption">Saxa - 4</p>
-    <p class="name-list">Nicholas Reese</p>
-    <p class="name-list">Ashlyn Bellardine</p>
-    <p class="name-list">Osama Bin Habib</p>
-    <p class="name-list">Dezmond Richardson</p>
-    <p class="name-list">Genesis Roberto</p>
-    
-    """,
-    unsafe_allow_html=True
-)
+# --- Helper Functions ---
 
-st.markdown('---')
-#####################################################################
-csv_file_path = 'spacy_redacted_documents_with_id_and_category.csv'
-data = pd.read_csv(csv_file_path)
-json_file_path = 'spacy_redacted_documents_with_id_and_category.json'
-
-data.to_json(json_file_path, orient = 'records', lines = True)
-
-resumes = data
-
-# This below is used for reading in anytype of resume.
-st.markdown('# Recommendation System')
-st.markdown('---')
-#####################################################################
-
-st.write('## Section 1 - Loading Resume')
-st.markdown('### Upload your Resume')
-
-import streamlit as st
-import pandas as pd
-from docx import Document
-import pdfplumber
-
-# Initialize resume_df globally
-resume_df = None
-
-uploaded_file = st.file_uploader(
-    'Drag & Drop your resume. We can analyze word, pdf, txt or csv',
-    type=['docx', 'txt', 'pdf', 'csv']
-)
-
-# Define functions for reading files
 def read_docx(file):
     doc = Document(file)
-    data = [para.text for para in doc.paragraphs]
+    data = [para.text for para in doc.paragraphs if para.text.strip() != ""]
     return pd.DataFrame(data, columns=['Redacted Text'])
 
 def read_txt(file):
     data = file.read().decode("utf-8").splitlines()
-    return pd.DataFrame(data, columns=['Redacted Text'])
+    return pd.DataFrame([line for line in data if line.strip() != ""], columns=['Redacted Text'])
 
 def read_pdf(file):
     with pdfplumber.open(file) as pdf:
@@ -101,14 +57,99 @@ def read_pdf(file):
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                data.extend(text.splitlines())
+                data.extend([line for line in text.splitlines() if line.strip() != ""])
         return pd.DataFrame(data, columns=['Redacted Text'])
 
-def read_csv(file):
-    return pd.read_csv(file)
+def calc_sim(user_resume_df, database_df):
+    """Calculate cosine similarity between user resume and database."""
+    # Convert dataframe to a single string of text
+    new_resume_text = " ".join(user_resume_df['Redacted Text'].astype(str).tolist())
+    
+    db_texts = database_df['Redacted Text'].astype(str).tolist()
+    all_texts = db_texts + [new_resume_text]
+    
+    vec = TfidfVectorizer(stop_words=sw)
+    tfidf_matrix = vec.fit_transform(all_texts)
+    
+    # Compare the last item (user) against all previous items (database)
+    similarity_matrix = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])
+    similar_indices = similarity_matrix.argsort()[0][-5:][::-1]
+    
+    return similar_indices
 
-# Process uploaded file
-if uploaded_file is not None:
+def ner_redaction(text):
+    """Redact PII using Spacy NER."""
+    if not nlp:
+        return text
+    doc = nlp(text)
+    redacted_text = text
+
+    # Sort entities by length descending to avoid partial redaction issues
+    entities = sorted(doc.ents, key=lambda x: len(x.text), reverse=True)
+    
+    # Specific categories to redact
+    target_labels = ['PERSON', 'ORG', 'GPE', 'FAC', 'LOC']
+    
+    for ent in entities:
+        if ent.label_ in target_labels:
+            redacted_text = redacted_text.replace(ent.text, "[Redacted]")
+
+    # Regex for Contact Info
+    redacted_text = re.sub(r'\S+@\S+', '[Redacted Email]', redacted_text)
+    redacted_text = re.sub(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[Redacted Phone]', redacted_text)
+    redacted_text = re.sub(r'\b(?:https?://)?(?:www\.)?linkedin\.com/in/[a-zA-Z0-9._-]+\b', '[Redacted Website]', redacted_text)
+    
+    return redacted_text
+
+# --- UI Setup ---
+
+st.set_page_config(page_title="Saxa-4 Recommendation System", layout="wide")
+
+# Use local relative path for images
+if os.path.exists('georgetown_image.jpeg'):
+    st.image('georgetown_image.jpeg', use_container_width=True)
+
+st.markdown("""
+    <style>
+    .main-caption { font-size: 24px; font-weight: bold; text-align: center; color: #333; }
+    .name-list { font-size: 18px; text-align: center; color: #555; }
+    </style>
+    <p class="main-caption">Saxa - 4</p>
+    <p class="name-list">Nicholas Reese | Ashlyn Bellardine | Osama Bin Habib | Dezmond Richardson | Genesis Roberto</p>
+    """, unsafe_allow_html=True)
+
+st.markdown('---')
+
+# --- Data Loading ---
+# Using relative paths for deployment compatibility
+csv_file_path = 'spacy_redacted_documents_with_id_and_category.csv'
+json_db_path = 'redacted_resumes_output.json'
+
+if os.path.exists(csv_file_path):
+    resumes_db = pd.read_csv(csv_file_path)
+else:
+    st.error(f"Database file {csv_file_path} not found.")
+    resumes_db = pd.DataFrame(columns=['Redacted Text'])
+
+# --- OpenAI Client Setup ---
+# Priority: Streamlit Secrets (for cloud) -> Environment Variable
+api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key) if api_key else None
+
+# --- Main App Logic ---
+
+st.markdown('# Recommendation System')
+st.write('## Section 1 - Loading Resume')
+
+uploaded_file = st.file_uploader(
+    'Drag & Drop your resume (PDF, DOCX, TXT, CSV)',
+    type=['docx', 'txt', 'pdf', 'csv']
+)
+
+resume_df = None
+resume_text_raw = ""
+
+if uploaded_file:
     if uploaded_file.name.endswith('.docx'):
         resume_df = read_docx(uploaded_file)
     elif uploaded_file.name.endswith('.txt'):
@@ -116,443 +157,104 @@ if uploaded_file is not None:
     elif uploaded_file.name.endswith('.pdf'):
         resume_df = read_pdf(uploaded_file)
     elif uploaded_file.name.endswith('.csv'):
-        resume_df = read_csv(uploaded_file)
+        resume_df = pd.read_csv(uploaded_file)
+    
+    if resume_df is not None:
+        st.markdown('### Non-Processed Resume')
+        st.dataframe(resume_df.head())
+        resume_text_raw = " ".join(resume_df.iloc[:, 0].astype(str).tolist())
     else:
-        st.error("Unsupported file type!")
-
-# Display DataFrame if available
-if resume_df is not None:  # Check if resume_df has been successfully populated
-    st.markdown('### Non-Processed Resume')
-    st.dataframe(resume_df)
-else:
-    st.markdown("No resume uploaded or file could not be processed.")
-
-#######################################################################
-
-
-
-st.markdown('---')
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key)
-st.markdown('## Section 2 - LLM')
-
-st.markdown('### Recommender Output')
-st.markdown('#### Below the Recommendation will be using a default prompt selected by the team')
-
-st.markdown('---')
-st.write("""
-       You are a helpful recommender tool. You will be provided a resume where the individual would like to have a different but similar
-        job recommended to them based off their resume. Your goal will be to provide the five most similar jobs to what is on their resume that they provided.
-        For each recommendation, please provide an explanation as to why you chose the job you did for the individual.
-        """)
-
-st.markdown('---')
-# 
-#Verify that the environment variable is set
-
-
-#######################################################################
-# Adding Stopwords and Vectorizing 
-
-sw = stopwords.words("english")
-sw.extend(['[Redacted]'])
-
-vec = TfidfVectorizer(stop_words = sw)
-
-################################
-
-# Calculating Distance 
-
-
-def calc_sim(resume_df, resumes):
-    
-    new_resume = str(resume_df)
-    
-    resumes['Redacted Text'] = resumes['Redacted Text'].astype(str)
-    
-    all_resumes = resumes['Redacted Text'].tolist() + [new_resume]
-    
-    vec = TfidfVectorizer(stop_words = sw)
-    tfidf_matrix = vec.fit_transform(all_resumes)
-    
-    similarity_matrix = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])
-    
-    similar_indices = similarity_matrix.argsort()[0][-5:][::-1]
-    
-    return similar_indices
-
-##################################################
-# Adding in the function to get recs
-
-resume_rec_prompt = '''
-        You are a helpful recommender tool. You will be provided a resume where the individual would like to have a different but similar
-        job recommended to them based off their resume. Your goal will be to provide the five most similar jobs to what is on their resume that they provided.
-        For each recommendation, please provide an explanation as to why you chose the job you did for the individual.
-
-        For example this is the structure that the ouput should be as follows:
-        
-        Based on the resume provided, here are five job recommendations for the individual:
-
-        1) Data Scientist: With experience in data analysis, modeling, and visualization, as well as proficiency in R, Python, and statistical software, 
-        the individual would be well-suited for a role as a Data Scientist. They have the skills necessary to work with diverse sources 
-        of data and develop predictive models.
-        '''
-new_resume = resume_df
-
-def get_rec_roles(new_resume, resumes):
-    
-    #new_resume = resume_df
-    similar_indices = calc_sim(new_resume, resumes)
-    
-    resumes_texts = resumes['Redacted Text'].tolist()
-    
-    selected_resumes = [resumes_texts[i] for i in similar_indices]
-    
-    prompt = resume_rec_prompt + '\n\n' + '\n'.join(selected_resumes)
-    
-    try:
-        response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature= 0.3
-    )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f' an error occurred at {e}')
-        return None
-
-result = get_rec_roles(new_resume, resumes)
-
-st.markdown(result)
-
-################################
-
-## Adding the Default Prompt
-default_prompt = '''
-You are a helpful recommender tool. You will be provided a resume where the individual would like to have a different but similar
-job recommended to them based off their resume. Your goal will be to provide five similar jobs to what is on their resume that they provided.
-For each recommendation, please provide an explanation as to why you chose the job you did for the individual.
-'''
-#####################################
-
-def calc_sim(resume_df, resumes):
-    
-    new_resume = str(resume_df)
-    
-    resumes['Redacted Text'] = resumes['Redacted Text'].astype(str)
-    
-    all_resumes = resumes['Redacted Text'].tolist() + [new_resume]
-    
-    vec = TfidfVectorizer(stop_words = sw)
-    tfidf_matrix = vec.fit_transform(all_resumes)
-    
-    similarity_matrix = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])
-    
-    similar_indices = similarity_matrix.argsort()[0][-5:][::-1]
-    
-    return similar_indices
-
-
-
-def get_rec_roles2(new_resume, resumes, user_prompt):
-    new_resume = resume_df
-    similar_indices = calc_sim(new_resume, resumes)
-    resumes_texts = resumes['Redacted Text'].tolist()
-    selected_resumes = [resumes_texts[i] for i in similar_indices]
-
-    prompt = user_prompt + '\n\n' + '\n'.join(selected_resumes)
-    try:
-        response = client.chat.completions.create(
-            model = 'gpt-3.5-turbo',
-            messages= [
-                {'role': 'user',
-                 'content': prompt}
-            ]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f'An error occured: {e}')
-        return None
+        st.error("Could not process file.")
 
 st.markdown('---')
 
-
-def main():
-    st.markdown("### Choose your own prompt")
-
-    user_prompt = st.text_area('Below you can ask your own prompt. If you have a specific industry in mind, you can see what skills might help you acquire a role', 
-                               value= default_prompt)
+if resume_df is not None and not resumes_db.empty:
+    st.markdown('## Section 2 - LLM Recommendations')
     
+    default_prompt = dedent("""
+        You are a helpful recommender tool. You will be provided a resume and a list of similar job examples. 
+        Your goal is to provide the five most similar job roles based on the skills in the resume. 
+        For each recommendation, provide a brief explanation.
+    """)
+
+    user_prompt = st.text_area("Customize your prompt:", value=default_prompt, height=150)
+
     if st.button('Get Recommendations'):
-        if new_resume is not None:
-            final_prompt = user_prompt.strip() if user_prompt.strip() else default_prompt
-            
-            recommendations = get_rec_roles2(new_resume, resumes, final_prompt)
-            if recommendations:
-                st.write('### Recommendations:')
-                st.write(recommendations)
-            else:
-                st.write('No Recs were generated')
-        else: 
-            st.write('Please enter your resume')
-if __name__ == '__main__':
-    main()    
-
-st.markdown('---')
-#######################################################################
-
-st.markdown('## Section 3 - PII')
-
-st.write("""
-         An issue that the team wanted to tackle with their Capstone was the redaction of Personally Identifiable Information or PII. There are many reasons why the team may want to redact PII,
-         but some that were the most prevelent were bias, privacy and accountability. 
-
-         The team wanted to test whether names of inidividuals, names of schools, names of former employeers, locations and other identifiable information produced a different output for a resume that had 
-         PII redacted and a resume without PII redacted. 
-
-         The same can be said about privacy and accountability, the team wanted to highlight the importance of keeping your information private. 
-         """)
-
-st.markdown('---')
-
-nlp = spacy.load("en_core_web_lg")
-
-#new_resume_text = resume_df
-
-def ner_pipeline(text):
-        doc = nlp(text)
-        return [{'word': ent.text, 'entity': ent.label_, 'score': ent.kb_id_ if ent.kb_id_ else 1.0} for ent in doc.ents]
-        #return entities
-
-
-def redaction(new_resume_text):
-    st.markdown('### Resume Redaction')
-    
-    entities = ner_pipeline(new_resume_text)
-    thresholds = {
-        'PERSON': 0.75,
-        'ORG': 0.99,
-        'GPE': 0.99, 
-        }
-
-    redacted_text = new_resume_text
-
-    for entity in sorted(entities, key= lambda x: len(x['word']), reverse= True):
-        score = float(entity.get('score', 1.0))
-        if score >= thresholds.get(entity['entity'], 0):
-            redacted_text = re.sub(re.escape(entity['word']), '[Redacted]', 
-                                   redacted_text)
-
-    #entities_sorted = sorted(entities, key= lambda x:len(x['word']), reverse= True)
-    #for entity in entities_sorted:
-     #   entity_text = entity['word']
-      #  entity_label = entity['entity']
-       # score = entity.get('score', 1.0)
-
-    
-    redacted_text = re.sub(r'\S+@\S+', '[Redacted Email]', redacted_text)
-    redacted_text = re.sub(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[Redacted Phone]', redacted_text)
-    redacted_text = re.sub(r'\b(?:https?://)?(?:www\.)?linkedin\.com/in/[a-zA-Z0-9._-]+\b', '[Redacted Website]', redacted_text)
-    
-    return pd.DataFrame({
-        'Redacted Text': [redacted_text]
-    })
-    #return spacy_redacted_resume
-
-
-def extract_text_from_pdf(file):
-    """Extracts text from a PDF file using pdfplumber."""
-    text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() + "\n"
-    return text
-
-def extract_text_from_docx(file):
-    """Extracts text from a Word document."""
-    text = ""
-    doc = Document(file)
-    for paragraph in doc.paragraphs:
-        text += paragraph.text + "\n"
-    return text
-
-
-#st.title("Resume Redaction")
-#st.title("Resume Redaction Tool")
-
-
-if uploaded_file is not None:
-    if uploaded_file.type == "application/pdf":
-        resume_text = extract_text_from_pdf(uploaded_file)
-    elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        resume_text = extract_text_from_docx(uploaded_file)
-    
-    
-    st.markdown("### Extracted Resume Text")
-    st.text_area("Resume Text", resume_text, height=300)
-
-    redacted_df = redaction(resume_text)
-    
-    
-    #st.markdown("### Redacted Resume")
-    st.dataframe(redacted_df)  
-else:
-    st.write("Please upload a PDF or Word document to see the extracted text and redacted version.")
-
-
-
-
-#######################################################################
-st.write('''
-         Now take a look and see what was redacted from your resume. Here we can see that our NER model
-         is redacting information like your location, name, email, as well as the name of the schools or schools
-         you may have gone to. 
-         ''')
-st.markdown('---')
-
-#######################################################################
-
-st.markdown('### Section 4 - Recommendation With Redaction')
-
-st.markdown('---')
-
-
-def get_rec_roles_redaction(redacted_df, resumes):
-    
-    #new_resume = resume_df
-    similar_indices = calc_sim(redacted_df, resumes)
-    
-    resumes_texts = resumes['Redacted Text'].tolist()
-    
-    selected_resumes = [resumes_texts[i] for i in similar_indices]
-    
-    prompt = resume_rec_prompt + '\n\n' + '\n'.join(selected_resumes)
-    
-    try:
-        response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature= 0.5
-    )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f' an error occurred at {e}')
-        return None
-
-result2 = get_rec_roles_redaction(redacted_df, resumes)
-
-
-st.markdown(result2)
-st.markdown('---')
-
-##########################################################################
-
-st.markdown('### Section 5 - Redaction Recommendation with Prompt Enhancement')
-st.write('''
-         What we are seeing above is that the recommendations may have some "hallunications" based off how the similarity distance is calculated.
-         Specifically, the team believes this effect may be coming from the LLM's lack of knowledge that the resumes have redacted
-         information. As such the prompt below updates provides the LLM with additional knowledge. 
-         ''')
-
-
-st.write('''
-         You are a helpful recommender tool. You will be provided a resume where the individual would like to have a different but similar
-        job recommended to them based off their resume. Your goal will be to provide the five most similar jobs to what is on their resume that they provided.
-        For each recommendation, please provide an explanation as to why you chose the job you did for the individual. The resume will have all 
-        PII (personal Identifiable information) redacted and this will be shown as "[Redacted]" please keep this in mind when recommending. 
-
-        ''')
-
-st.markdown('---')
-
-
-redacted_prompt = '''
-You are a helpful recommender tool. You will be provided a resume where the individual would like to have a different but similar
-        job recommended to them based off their resume. Your goal will be to provide the five most similar jobs to what is on their resume that they provided.
-        For each recommendation, please provide an explanation as to why you chose the job you did for the individual.The resume will have all 
-        PII (personal Identifiable information) redacted and this will be shown as "[Redacted]" please keep this in mind when recommending. 
-
-
-        For example this is the structure that the ouput should be as follows:
-        
-        Based on the resume provided, here are five job recommendations for the individual:
-
-        1) Data Scientist: With experience in data analysis, modeling, and visualization, as well as proficiency in R, Python, and statistical software, 
-        the individual would be well-suited for a role as a Data Scientist. They have the skills necessary to work with diverse sources 
-        of data and develop predictive models.
-
-'''
-
-def get_rec_roles_redaction_with_redacted_prompt(redacted_df, resumes):
-    
-    #new_resume = resume_df
-    similar_indices = calc_sim(redacted_df, resumes)
-    
-    resumes_texts = resumes['Redacted Text'].tolist()
-    
-    selected_resumes = [resumes_texts[i] for i in similar_indices]
-    
-    prompt = resume_rec_prompt + '\n\n' + '\n'.join(selected_resumes)
-    
-    try:
-        response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": redacted_prompt}
-        ],
-        temperature= 0.5
-    )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f' an error occurred at {e}')
-        return None
-
-result3 = get_rec_roles_redaction_with_redacted_prompt(redacted_df, resumes)
-st.markdown(result3)
-#########################################
-
-st.markdown('### Section 6 - Data Privacy Concerns')
-
-st.write('''
-
-        When it comes to a consumers choice, the team wanted to ensure that the individual had the decision to allow
-        the use of their information, regardless of the redaction. This attribute of privacy transparency guarantees
-        ethical use of their data.  
-        ''')
-
-st.markdown('---')
-
-json_file_path = '/Users/nicholasreese/Desktop/Georgetown/Capstone/capstone_github/Capstone_Introduction/Saxa-4-Capstone/redacted_resumes_output.json'
-
-def add_resume_to_database(redacted_df, json_file_path):
-    if os.path.exists(json_file_path):
-        existing_data = pd.read_json(json_file_path, lines= True)
-    else:
-        existing_data = pd.DataFrame()
-    
-    combined_data = pd.concat([existing_data, redacted_df], ignore_index= True).drop_duplicates()
-    if len(combined_data) == len(existing_data):
-        return False
-    else:
-        combined_data.to_json(json_file_path, orient= 'records', lines=True)
-        return True
-
-def main():
-    st.subheader('To better our recomendations, could we add your resume?')
-    if st.button('Yes'):
-        added = add_resume_to_database(redacted_df, json_file_path)
-        if added: 
-            st.success('The redacted resume has been added. Thank you!')
+        if not client:
+            st.error("OpenAI API Key missing. Please check your secrets.")
         else:
-            st.warning('This resume has already been added. Thank you for your ongoing support!')
-    elif st.button('No'):
-        st.info('This resume has not been added, thank you for using our product')
+            with st.spinner('Analyzing similarities...'):
+                indices = calc_sim(resume_df, resumes_db)
+                similar_docs = "\n---\n".join(resumes_db.iloc[indices]['Redacted Text'].tolist())
+                
+                full_query = f"{user_prompt}\n\nUser Resume Content:\n{resume_text_raw}\n\nSimilar Examples to Reference:\n{similar_docs}"
+                
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": full_query}],
+                        temperature=0.3
+                    )
+                    st.markdown("### Recommendation Output")
+                    st.write(response.choices[0].message.content)
+                except Exception as e:
+                    st.error(f"LLM Error: {e}")
 
-if __name__ == '__main__':
-    main()
+    st.markdown('---')
+    st.markdown('## Section 3 - PII Redaction')
+    
+    if st.checkbox("Show Redacted Version"):
+        redacted_text = ner_redaction(resume_text_raw)
+        st.markdown("### Redacted Resume Content")
+        st.text_area("Redacted Output", redacted_text, height=300)
+        
+        redacted_df = pd.DataFrame({'Redacted Text': [redacted_text]})
 
+        st.markdown('### Section 4 - Recommendation with Prompt Enhancement')
+        st.info("This version informs the LLM specifically that information has been redacted.")
+        
+        if st.button('Get Recommendations (Redacted)'):
+            with st.spinner('Processing...'):
+                enh_prompt = f"The following resume has PII redacted as [Redacted]. Please recommend 5 roles based on the visible skills:\n\n{redacted_text}"
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": enh_prompt}],
+                        temperature=0.5
+                    )
+                    st.write(response.choices[0].message.content)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        # --- Data Privacy Section ---
+        st.markdown('---')
+        st.subheader('To better our recommendations, could we add your redacted resume to our database?')
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button('Yes, save my redacted data'):
+                # Append to JSON
+                new_entry = redacted_df.to_dict(orient='records')
+                try:
+                    existing_entries = []
+                    if os.path.exists(json_db_path):
+                        with open(json_db_path, 'r') as f:
+                            for line in f:
+                                existing_entries.append(json.loads(line))
+                    
+                    # Check for duplicates
+                    if any(e['Redacted Text'] == redacted_text for e in existing_entries):
+                        st.warning("This content is already in our database.")
+                    else:
+                        with open(json_db_path, 'a') as f:
+                            f.write(json.dumps(new_entry[0]) + "\n")
+                        st.success("Thank you! Your data was added anonymously.")
+                except Exception as e:
+                    st.error(f"Saving error: {e}")
+        
+        with col2:
+            if st.button('No, keep it private'):
+                st.info("We respect your privacy. No data was saved.")
+
+else:
+    st.info("Upload a resume to begin the analysis.")
